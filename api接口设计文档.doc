@@ -1,0 +1,165 @@
+详细 API 接口设计 (V1)
+通用约定：
+Base URL: http://<your-domain-or-ip>:<port>/api/v1
+认证: 部分接口（如提交翻译任务）可能需要在请求头或请求体中包含 api_key (针对智谱等第三方服务)。具体 API Key 的管理和传递方式需符合安全实践，例如通过请求头 Authorization: Bearer <user_session_token_or_service_api_key> (如果后端有用户认证体系)，或者在特定服务配置中传递。目前文档设定是在 translation_service_config 中。
+请求头 Content-Type:
+对于发送 JSON 数据的请求 (如 POST /translation-jobs)：application/json
+对于文件上传 (POST /files/upload)：multipart/form-data
+响应头 Content-Type:
+对于返回 JSON 数据的响应：application/json; charset=utf-8
+对于文件下载 (GET /translation-jobs/{job_id}/download)：application/vnd.openxmlformats-officedocument.spreadsheetml.sheet (for .xlsx) or application/vnd.ms-excel (for .xls)
+统一错误响应体 (JSON):
+{
+  "detail": { // FastAPI 默认的错误响应体结构通常是 {"detail": "Error message"} 或 {"detail": [{"loc": ..., "msg": ..., "type": ...}]}
+    "type": "ERROR_TYPE_CODE", // 自定义错误类型码，可选
+    "message": "A human-readable error message.",
+    "fields": { // 可选，用于表单校验错误
+      "field_name": "Error details for this specific field."
+    }
+  }
+}
+或者直接使用 FastAPI 默认的详细错误信息。
+1. 文件上传接口
+Endpoint: POST /api/v1/files/upload
+目的: 上传待翻译的 Excel 文件到服务器。
+请求:
+方法: POST
+头部: Content-Type: multipart/form-data
+表单数据:
+file: (必需) Excel 文件 (.xlsx 或 .xls)
+成功响应 (Status Code: 201 Created):
+主体 (JSON):
+{
+  "file_id": "unique_server_generated_file_identifier_string", // 例如 UUID
+  "filename": "original_uploaded_filename.xlsx",
+  "uploaded_at": "timestamp_iso_format" // 例如 "2024-05-24T10:30:00Z"
+}
+错误响应:
+400 Bad Request: 文件未提供、文件类型不支持、文件过大等。
+500 Internal Server Error: 服务器存储文件失败。
+2. 翻译任务创建与启动接口
+Endpoint: POST /api/v1/translation-jobs
+目的: 创建一个新的翻译任务，并将其加入处理队列。
+请求:
+方法: POST
+头部: Content-Type: application/json
+主体 (JSON):
+{
+  "file_id": "string", // (必需) 从文件上传接口获取的 file_id
+  "source_language": "string", // (必需) 源语言代码 (例如 "auto", "zh", "en")
+  "target_language": "string", // (必需) 目标语言代码 (例如 "en", "ja")
+  "source_column": "string", // (必需) Excel 中的原文列标识 (例如 "A", "Sheet1!A", 或列名如 "原文内容")
+  "target_column_name": "string", // (必需) 翻译结果写入的新列的名称 (例如 "英文翻译")
+  "translation_service_config": { // (必需)
+    "provider": "zhipu_ai", // (必需) 目前固定为 "zhipu_ai"
+    "api_key": "string",    // (必需) 用户提供的智谱 AI API Key
+    "use_batch_api": true   // (必需) 固定为 true，指示使用批量接口
+    // "model": "zhipu_model_name" // (可选) 如果智谱支持指定模型，可以在此添加
+  },
+  "tag_patterns": [ // (可选) 正则表达式列表，用于识别不可翻译标签
+    "\\{[^\\}]+\\}", // 示例：匹配 {$variable}
+    "<[^>]+>"        // 示例：匹配 <tag>
+  ],
+  "non_translate_terms": [ // (可选) 不翻译词汇列表
+    "GameCompanyName",
+    "PlayerCharacterName"
+  ],
+  "callback_url": "string" // (可选) 任务完成后回调通知的 URL
+}
+成功响应 (Status Code: 202 Accepted):
+主体 (JSON):
+{
+  "job_id": "unique_server_generated_job_identifier_string", // 例如 UUID
+  "status": "queued", // 初始状态
+  "created_at": "timestamp_iso_format",
+  "message": "Translation job accepted and queued for processing."
+}
+错误响应:
+400 Bad Request: 请求体格式错误，缺少必要字段。
+404 Not Found: 提供的 file_id 无效或文件不存在。
+422 Unprocessable Entity: 语义错误，例如语言代码不支持，api_key 格式不正确（非空校验等）。
+500 Internal Server Error: 任务入队失败等。
+3. 翻译任务状态查询接口
+Endpoint: GET /api/v1/translation-jobs/{job_id}/status
+目的: 查询指定翻译任务的当前状态和进度。
+请求:
+方法: GET
+路径参数:
+job_id: (必需) 要查询的任务 ID。
+成功响应 (Status Code: 200 OK):
+主体 (JSON):
+{
+  "job_id": "string",
+  "status": "string", // e.g., "queued", "preprocessing", "translating", "postprocessing", "completed", "failed", "partial_success"
+  "progress": {
+    "total_segments": "integer",         // 总文本片段数
+    "processed_segments": "integer",     // 已处理（尝试翻译）的片段数
+    "translated_segments": "integer",    // 成功翻译的片段数 (智谱批量API可能返回部分成功)
+    "percentage_complete": "float"   // (processed_segments / total_segments) * 100
+  },
+  "estimated_time_remaining_seconds": "integer", // (可选) 预估剩余时间（秒）
+  "created_at": "timestamp_iso_format",
+  "updated_at": "timestamp_iso_format",
+  "error_message": "string_or_null", // 如果 status 是 "failed"，这里提供错误信息
+  "warnings": [ // (可选) 如果有非致命警告，例如某些行无法解析
+     "string"
+  ]
+}
+错误响应:
+404 Not Found: 指定的 job_id 不存在。
+500 Internal Server Error: 查询状态时发生内部错误。
+4. 翻译结果下载接口
+Endpoint: GET /api/v1/translation-jobs/{job_id}/download
+目的: 下载已完成翻译的 Excel 文件。
+请求:
+方法: GET
+路径参数:
+job_id: (必需) 要下载结果的任务 ID。
+成功响应 (Status Code: 200 OK):
+头部:
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet (或 application/vnd.ms-excel)
+Content-Disposition: attachment; filename="translated_document_{job_id}.xlsx"
+主体: 二进制文件流 (翻译后的 Excel 文件内容)。
+错误响应:
+404 Not Found: 指定的 job_id 不存在，或任务结果文件不存在。
+409 Conflict (或 400 Bad Request): 任务尚未完成或任务失败，无法下载。
+500 Internal Server Error: 读取结果文件时发生内部错误。
+5. (可选) 配置接口
+5.1 获取支持的语言列表
+Endpoint: GET /api/v1/config/supported-languages
+目的: 获取翻译服务（当前为智谱）支持的源语言和目标语言列表。
+请求:
+方法: GET
+成功响应 (Status Code: 200 OK):
+主体 (JSON):
+{
+  "source_languages": [
+    {"code": "auto", "name": "自动检测"},
+    {"code": "zh", "name": "中文"},
+    {"code": "en", "name": "英文"}
+    // ...更多语言
+  ],
+  "target_languages": [
+    {"code": "en", "name": "英文"},
+    {"code": "ja", "name": "日文"}
+    // ...更多语言
+  ]
+}
+错误响应:
+500 Internal Server Error: 获取配置信息失败。
+5.2 获取默认/推荐标签模式
+Endpoint: GET /api/v1/config/default-tag-patterns
+目的: 获取一些常用的、推荐用于标签保护的正则表达式模式。
+请求:
+方法: GET
+成功响应 (Status Code: 200 OK):
+主体 (JSON):
+{
+  "patterns": [
+    {"name": "花括号变量", "regex": "\\{[^\\}]+\\}", "description": "例如：{$playerName}"},
+    {"name": "尖括号标签", "regex": "<[^>]+>", "description": "例如：<color=red>"},
+    {"name": "方括号图标", "regex": "\\[[^\\]]+\\]", "description": "例如：[icon:gold]"}
+  ]
+}
+错误响应:
+500 Internal Server Error: 获取配置信息失败

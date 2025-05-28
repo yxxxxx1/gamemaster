@@ -1,0 +1,405 @@
+项目开发指导文档：AI 游戏本地化文件翻译工具
+版本： 1.0
+日期： 2024年5月24日
+目录
+项目概述
+1.1 项目目标
+1.2 核心功能
+1.3 技术栈选型
+需求规格
+2.1 功能性需求
+2.2 非功能性需求 (性能、安全、易用性)
+2.3 关键特性：标签与符号保护
+2.4 关键特性：AI 模型翻译 (智谱清言批量接口)
+系统架构
+3.1 前后端分离架构
+3.2 后端架构
+3.3 前端架构
+3.4 API 设计原则
+详细 API 接口设计
+4.1 文件上传接口 (/api/v1/files/upload)
+4.2 翻译任务创建与启动接口 (/api/v1/translation-jobs)
+4.3 翻译任务状态查询接口 (/api/v1/translation-jobs/{job_id}/status)
+4.4 翻译结果下载接口 (/api/v1/translation-jobs/{job_id}/download)
+4.5 (可选) 配置接口 (/api/v1/config/...)
+开发阶段与里程碑
+5.1 阶段 0: 后端 API 核心实现与测试 (集成智谱批量API)
+目标回顾：
+搭建 FastAPI 后端应用。
+实现文件上传接口 (POST /api/v1/files/upload)，能够接收 Excel 文件并保存。
+实现翻译任务创建与启动接口 (POST /api/v1/translation-jobs) 的基本框架，能够接收参数，并为后续集成核心逻辑做准备。
+实现翻译任务状态查询接口 (GET /api/v1/translation-jobs/{job_id}/status) 和结果下载接口 (GET /api/v1/translation-jobs/{job_id}/download) 的基本框架。
+核心任务： 封装调用智谱批量翻译 API (https://bigmodel.cn/dev/api/batch-api/batch) 的逻辑。
+核心任务： 实现基础的标签保护机制（占位符替换与恢复）。
+初步集成上述核心任务到 translation-jobs 的处理流程中（可以先同步处理，后续阶段再用 Celery 异步化）。
+使用 Pydantic 定义清晰的数据模型。
+利用 FastAPI 自动生成 OpenAPI (Swagger UI) 文档。
+通过 Postman 或类似工具对实现的 API 进行初步测试，特别是验证小批量文本的标签保护和智谱批量翻译流程。
+开发步骤与内容概要：
+1. 项目初始化与环境设置
+创建项目目录结构。
+设置 Python 虚拟环境。
+安装必要的库：
+fastapi
+uvicorn[standard] (ASGI 服务器)
+pydantic (FastAPI 依赖)
+python-multipart (用于文件上传)
+pandas
+openpyxl (或 xlrd 如果需要支持 .xls)
+httpx (用于调用外部 API，支持异步)
+python-dotenv (可选，用于管理环境变量如 API Key)
+2. Pydantic 模型定义 (models.py)
+根据我们详细 API 设计文档中的 JSON 结构，创建 Pydantic 模型。例如：
+FileUploadResponse
+TranslationServiceConfig
+TranslationJobRequest
+TranslationJobCreateResponse (用于 POST /translation-jobs 成功响应)
+JobStatusProgress
+JobStatusResponse
+SupportedLanguage
+SupportedLanguagesResponse
+DefaultTagPattern
+DefaultTagPatternsResponse
+错误响应模型 (FastAPI 会自动处理很多，但可以为自定义错误类型创建模型)
+3. 核心服务模块 (services.py 或多个服务文件)
+file_service.py:
+save_uploaded_file(file: UploadFile) -> Tuple[str, str]: 保存上传的文件到临时目录，返回 file_id 和原始文件名。
+get_file_path(file_id: str) -> Path: 根据 file_id 获取文件路径。
+read_excel_column(file_path: Path, column_identifier: str) -> List[str]: 读取 Excel 指定列的文本数据。
+tag_protection_service.py:
+protect_tags(text: str, tag_patterns: List[str]) -> Tuple[str, Dict[str, str]]: 将文本中的标签替换为占位符，返回处理后的文本和占位符到原始标签的映射。
+restore_tags(text_with_placeholders: str, mapping: Dict[str, str]) -> str: 将翻译结果中的占位符恢复为原始标签。
+zhipu_ai_service.py (智谱 AI 服务):
+translate_batch(texts: List[str], api_key: str, source_lang: str, target_lang: str) -> List[str]:
+构建符合智谱批量 API (https://bigmodel.cn/dev/api/batch-api/batch) 要求的请求体。
+使用 httpx.AsyncClient (或同步 httpx.Client 用于阶段0) 发送 POST 请求到智谱批量 API。
+处理响应，包括可能的错误和速率限制（初步处理）。
+返回翻译结果列表，确保与输入文本列表顺序一致。
+translation_job_service.py:
+process_translation_job(job_request: TranslationJobRequest) -> Dict: (阶段0的同步核心逻辑)
+获取文件路径。
+读取 Excel 原文列。
+对每段原文：
+应用 protect_tags。
+收集所有处理过的文本片段。
+调用 zhipu_ai_service.translate_batch 进行批量翻译。
+对每段翻译结果：
+应用 restore_tags。
+(暂时) 将结果保存在内存或简单存储中，准备后续写入 Excel 文件。
+返回任务处理结果的摘要或状态。
+4. API 路由实现 (routers/ 目录下，例如 files.py, jobs.py, config.py)
+routers/files.py:
+POST /upload: 调用 file_service.save_uploaded_file。
+routers/jobs.py:
+POST /translation-jobs:
+接收 TranslationJobRequest。
+初步校验（例如 file_id 是否存在 - 可以先 mock）。
+（阶段 0 同步调用）调用 translation_job_service.process_translation_job。
+（阶段 0 简化）模拟任务创建和入队，返回 TranslationJobCreateResponse。
+实际的任务持久化、状态更新等将在后续阶段完善。
+GET /{job_id}/status: （阶段 0 简化）返回一个 mock 的状态或基于内存中简单存储的状态。
+GET /{job_id}/download: （阶段 0 简化）如果能获取到处理结果，尝试构建一个简单的 Excel 文件并返回。
+routers/config.py:
+GET /supported-languages: 返回硬编码或从智谱文档获取的语言列表。
+GET /default-tag-patterns: 返回硬编码的推荐标签模式。
+5. 主应用文件 (main.py)
+创建 FastAPI 应用实例。
+包含各个路由。
+配置 CORS (如果前端在不同源)。
+(可选) 配置静态文件目录，用于临时存储上传的文件和生成的翻译文件。
+6. 配置文件 (.env 和 config.py)
+.env: (可选) 存储 ZHIPU_API_KEY (如果不想在请求中传递或用于测试)。
+config.py: 读取环境变量，提供应用配置。
+7. 初步测试 (手动使用 Postman/Insomnia)
+文件上传:
+发送一个 .xlsx 文件到 POST /api/v1/files/upload。
+验证响应是否为 201 Created 并包含 file_id 和 filename。
+检查服务器上文件是否正确保存。
+翻译任务创建 (核心测试):
+准备一个包含少量文本和简单标签（例如 {$var}）的 Excel 文件，并上传获取 file_id。
+向 POST /api/v1/translation-jobs 发送包含有效 file_id、语言、列信息、智谱 API Key 和简单 tag_patterns 的请求。
+验证点：
+后端能否正确读取 Excel 列内容。
+标签保护机制是否生效（可以在日志中打印占位符替换前后的文本）。
+智谱批量 API 是否被调用（可以在日志中打印请求体和响应状态）。
+翻译结果中的占位符是否被正确恢复。
+（如果实现了）能否得到包含翻译结果的初步输出（即使只是日志打印）。
+状态查询和下载:
+调用 GET /api/v1/translation-jobs/{job_id}/status 查看模拟状态。
+尝试调用 GET /api/v1/translation-jobs/{job_id}/download。
+阶段 0 的侧重点：
+打通主流程： 文件 -> 提取文本 -> 标签保护 -> 智谱批量翻译 -> 标签恢复 -> (初步)结果。
+API 契约： 确保 API 的请求和响应结构与设计文档一致，以便前端可以开始对接。
+核心逻辑验证： 标签保护和智谱批量调用是本阶段的重中之重。
+简化处理： 任务持久化、真正的异步处理、完整的错误处理、Excel 文件生成等可以暂时简化或 mock，留到后续阶段。
+代码组织建议：
+project_root/
+├── app/
+│   ├── __init__.py
+│   ├── main.py             # FastAPI app instance, include routers
+│   ├── models.py           # Pydantic models
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── file_service.py
+│   │   ├── tag_protection_service.py
+│   │   ├── zhipu_ai_service.py
+│   │   └── translation_job_service.py # Core logic
+│   ├── routers/
+│   │   ├── __init__.py
+│   │   ├── files.py
+│   │   ├── jobs.py
+│   │   └── config.py
+│   ├── core/               # Optional: for config, db connections later
+│   │   ├── __init__.py
+│   │   └── config.py
+│   └── temp_files/         # For storing uploaded and generated files (ensure .gitignore)
+├── tests/                  # Unit and integration tests later
+├── .env                    # Environment variables (e.g., API keys)
+├── .gitignore
+├── requirements.txt
+└── README.md
+5.2 阶段 1: 前端基础界面搭建与 API 对接
+5.3 阶段 2: 增强的标签管理与配置化 (前后端)
+5.4 阶段 3: 健壮的异步处理与性能优化 (后端)
+5.5 阶段 4: (可选) 多翻译模型支持
+5.6 阶段 5: 用户体验优化、部署与迭代
+数据模型 (Pydantic 示例)
+标签与符号处理策略
+错误处理与日志策略
+测试策略
+9.1 单元测试
+9.2 集成测试
+9.3 端到端测试
+9.4 用户验收测试 (UAT)
+部署策略
+验收标准
+附录 (可选)
+1. 项目概述
+1.1 项目目标
+开发一款高效、准确的AI游戏本地化文件翻译工具，旨在解决游戏文本中特殊标签和符号在翻译过程中不被破坏的问题，利用AI翻译模型（默认智谱清言）提升翻译质量和效率，并支持大规模Excel文件的快速处理。
+1.2 核心功能
+支持 Excel 文件上传。
+精确识别并保护游戏内特定标签和符号不被翻译。
+集成 AI 翻译模型（默认智谱清言，使用其批量翻译接口）。
+支持用户指定源语言、目标语言、原文列、译文列。
+提供翻译进度查询。
+允许下载翻译完成的 Excel 文件。
+支持灵活的标签规则配置。
+(远期) 支持多种翻译模型切换。
+1.3 技术栈选型
+后端： Python (FastAPI 框架)
+前端： 现代 JavaScript 框架 (如 Vue.js, React, 或 Svelte)
+数据库/缓存 (用于任务队列等)： Redis (推荐与 Celery 结合)
+Excel 处理： pandas, openpyxl
+HTTP 请求： httpx (FastAPI 推荐，支持异步) 或 requests + aiohttp
+任务队列 (用于异步处理)： Celery with Redis/RabbitMQ broker
+2. 需求规格
+2.1 功能性需求
+FR-001: 用户能够通过 Web 界面上传 .xlsx 或 .xls 格式的 Excel 文件。
+FR-002: 用户能够指定 Excel 文件中的原文所在列（列名或列号）。
+FR-003: 用户能够指定翻译结果写入的新列名。
+FR-004: 用户能够选择源语言和目标语言（支持智谱清言批量 API 支持的语言对）。
+FR-005: 系统必须在翻译前识别并保护文件中预定义的标签和符号（通过正则表达式配置），确保其在翻译后保持原样。
+FR-006: 系统使用智谱清言的批量翻译 API (https://bigmodel.cn/dev/api/batch-api/batch) 对提取的文本进行翻译。
+FR-007: 用户能够提供智谱清言的 API Key 用于翻译。
+FR-008: 系统能够将翻译结果（包含恢复的标签）准确写入到指定的输出列，并生成新的 Excel 文件供用户下载。
+FR-009: 用户能够在 Web 界面上查看翻译任务的实时进度（如：排队中、处理中、已完成百分比、失败）。
+FR-010: 用户能够配置自定义的标签识别规则（正则表达式列表）。
+FR-011: 用户能够配置不应被翻译的特定术语列表。
+FR-012: 系统应能处理包含上万行文本的 Excel 文件。
+2.2 非功能性需求
+NFR-001 (性能): 对于1万行文本（平均每行50字符）的 Excel 文件，在网络良好的情况下，翻译处理时间（从上传完成到可下载）应在合理范围内（具体指标待定，目标是显著快于逐行调用API）。
+NFR-002 (可扩展性): 后端架构应易于集成新的翻译服务提供商。
+NFR-003 (易用性): 前端界面应简洁直观，易于操作。
+NFR-004 (安全性): 用户 API Key 在传输和存储（如果需要临时存储）时应有适当的安全措施。不应硬编码敏感信息。
+NFR-005 (健壮性): 系统应能优雅处理常见的错误，如文件格式错误、网络中断、API 调用失败等，并向用户提供有意义的反馈。
+2.3 关键特性：标签与符号保护
+详见第 7 节"标签与符号处理策略"。核心是通过可配置的正则表达式将标签替换为唯一占位符，翻译后再恢复。
+2.4 关键特性：AI 模型翻译 (智谱清言批量接口)
+系统将优先使用智谱清言提供的批量翻译 API (https://bigmodel.cn/dev/api/batch-api/batch)。后端服务负责收集所有待翻译文本片段，按照该批量 API 的要求构建请求，一次性或分批（如果文本量超过单次限制）发送给智谱 API，并处理其批量响应。
+3. 系统架构
+3.1 前后端分离架构
+前端： 负责用户交互、数据展示、参数输入，通过 HTTP 调用后端 API。
+后端： 负责业务逻辑处理、文件解析、与外部翻译服务交互、任务管理、数据持久化（如果需要）。
+3.2 后端架构 (FastAPI)
+API 层： 定义 RESTful API 接口，使用 Pydantic 进行数据校验和序列化。
+服务层： 实现核心业务逻辑，如文件处理、文本提取、标签替换、与智谱 API 交互、任务状态管理。
+任务队列 (Celery + Redis)： 将耗时的翻译任务（特别是涉及批量 API 调用和文件 I/O）异步化处理，避免阻塞 API 请求。
+工具/助手模块： Excel 解析器、标签处理器、智谱 API客户端。
+3.3 前端架构
+组件化开发： 使用选定的 JS 框架 (Vue/React/Svelte) 构建可复用 UI 组件。
+状态管理： 管理应用级别状态（如用户信息、任务列表、当前任务进度）。
+API 服务模块： 封装对后端 API 的调用。
+3.4 API 设计原则
+RESTful 风格。
+使用 JSON 作为数据交换格式。
+清晰的 URL 结构。
+统一的错误响应格式。
+无状态（尽可能）。
+版本化 (/api/v1/...)。
+4. 详细 API 接口设计
+(此处复用之前讨论的API设计，并强调与智谱批量接口的关联)
+4.1 文件上传接口 (POST /api/v1/files/upload)
+请求：multipart/form-data (Excel 文件)
+响应：{ "file_id": "string", "filename": "string" }
+4.2 翻译任务创建与启动接口 (POST /api/v1/translation-jobs)
+请求 (JSON):
+响应：{ "job_id": "string", "status": "queued" }
+后端处理： 接收任务后，将通过 Celery 异步执行。工作者进程会读取 file_id 对应的文件，提取文本，应用标签保护，然后调用智谱的批量翻译API。
+4.3 翻译任务状态查询接口 (GET /api/v1/translation-jobs/{job_id}/status)
+响应 (JSON):
+4.4 翻译结果下载接口 (GET /api/v1/translation-jobs/{job_id}/download)
+响应：翻译后的 Excel 文件流。
+4.5 (可选) 配置接口 (GET /api/v1/config/...)
+例如：/api/v1/config/supported-languages (返回智谱支持的语言)
+例如：/api/v1/config/default-tag-patterns
+5. 开发阶段与里程碑
+(与之前方案一致，此处略作概括，每个阶段的产出物和验收标准需细化)
+阶段 0 (后端核心 - 约 X 周):
+目标：实现上述 API 核心功能，特别是与智谱批量 API 的成功对接和基本标签保护。
+验收：通过 Postman 等工具成功完成一次包含简单标签的 Excel 文件的小批量翻译。
+阶段 1 (前端基础 - 约 Y 周):
+目标：搭建基本前端界面，实现文件上传、参数配置、启动翻译、查看状态、下载结果。
+验收：用户能通过 Web 界面完成一次完整翻译流程。
+阶段 2 (配置增强 - 约 Z 周):
+目标：实现前端对标签规则、不翻译词汇的自定义配置，后端支持其存储和应用。
+验收：用户可以自定义标签规则并成功应用于翻译。
+阶段 3 (性能与异步 - 约 W 周):
+目标：引入 Celery+Redis 实现健壮的异步任务处理，优化大文件处理性能，处理API速率限制。
+验收：系统能稳定高效处理大型文件，前端有良好异步反馈。
+后续阶段： 多模型支持、用户体验打磨、部署。
+6. 数据模型 (Pydantic 示例 - 后端)
+7. 标签与符号处理策略
+配置： 用户通过前端界面（或配置文件）提供一组正则表达式，用于匹配需要保护的标签。例如：\{[^\}]+\} 匹配 {$variable}，<[^>]+> 匹配 HTML 标签。
+提取与替换：
+在将文本发送给翻译服务前，后端遍历每一行待翻译文本。
+对每一行文本，使用用户配置的正则表达式查找所有匹配的标签。
+为每个找到的标签生成一个唯一的、翻译服务不会翻译的临时占位符（如 __TAG_PROTECT_0__, __TAG_PROTECT_1__）。
+将原文中的标签替换为这些占位符。同时，存储原始标签与占位符的映射关系（例如，一个字典列表，每项包含原始标签、占位符、在原文中的位置）。
+翻译： 将替换了占位符的文本发送给智谱批量翻译 API。
+恢复：
+获取翻译结果后，根据之前存储的映射关系，将翻译结果中的占位符精确地替换回其对应的原始标签。
+需要注意顺序和位置，确保标签恢复到正确的地方。
+8. 错误处理与日志策略
+API 错误响应： 后端 API 对所有错误返回统一的 JSON 结构，包含错误码和可读的错误信息。
+日志记录 (后端)：
+使用 Python 的 logging 模块。
+记录关键操作：文件上传、任务创建、调用外部 API (请求参数脱敏后、响应状态)、标签处理步骤、错误堆栈。
+日志级别：DEBUG, INFO, WARNING, ERROR, CRITICAL。
+日志输出：控制台（开发环境）、文件（生产环境）。
+前端错误展示： 前端应能捕获 API 错误，并以用户友好的方式展示错误信息（如 Toast 通知、错误提示框）。
+9. 测试策略
+9.1 单元测试 (后端)：
+使用 pytest。
+测试单个函数和类，特别是：Excel 解析逻辑、标签替换与恢复逻辑、智谱 API 客户端的请求构建与响应解析（可 Mock 外部 API 调用）。
+9.2 集成测试 (后端)：
+测试模块间的交互，例如：从 API 端点接收请求到任务队列处理完成的流程。
+可以针对性地测试与 Redis、Celery 的集成。
+9.3 端到端测试 (E2E)：
+使用 Cypress, Selenium 或 Playwright。
+模拟用户通过前端界面完成整个翻译流程：上传文件 -> 配置参数 -> 启动翻译 -> 查看进度 -> 下载结果。
+验证不同类型标签的保护效果。
+9.4 用户验收测试 (UAT)：
+由项目发起人或最终用户代表，根据实际使用场景进行测试，验证是否满足所有核心需求。
+10. 部署策略
+后端 (FastAPI + Celery)：
+Docker化应用程序和 Celery worker。
+使用 Gunicorn/Uvicorn 作为 ASGI 服务器。
+使用 Nginx 作为反向代理。
+部署到云服务器 (AWS EC2, Azure VM, Google Cloud Compute Engine) 或 PaaS 平台 (Heroku, Google App Engine)。
+Redis 服务（云服务或自建）。
+前端：
+构建静态文件 (HTML, CSS, JS)。
+通过 CDN (Cloudflare, AWS S3+CloudFront) 或 Nginx 部署。
+CI/CD： 考虑使用 Jenkins, GitLab CI, GitHub Actions 实现自动化构建、测试和部署。
+11. 验收标准
+功能完整性： 所有在"2.1 功能性需求"中列出的功能点均已实现并通过测试。
+标签保护准确性： 对于预定义的各类标签（简单、嵌套、带参数等），在翻译后保持原样，位置准确。
+翻译质量： 使用智谱清言模型翻译的结果达到其应有水平（此项主观，但可通过对比评估）。
+性能达标： 满足"2.2 非功能性需求"中定义的性能指标。
+易用性： 前端界面操作流畅，引导清晰，用户能够轻松完成翻译任务。
+稳定性与错误处理： 系统在常见错误场景下表现稳定，并给出明确提示。
+文档完整性： API 文档（如 Swagger UI）清晰准确，关键代码有注释。
+测试覆盖率： 单元测试和集成测试达到预定覆盖率目标。
+成功处理大型文件： 能够顺利完成对至少包含1万行文本的Excel文件的翻译。
+智谱批量API成功集成： 日志或监控能确认后端确实是通过批量接口与智谱服务通信。
+12. 附录 (可选)
+词汇表
+关键决策记录
+第三方库列表与版本
+
+API接口测试地址： http://127.0.0.1:8000/api/v1/docs
+重启服务命令：uvicorn app.main:app --reload
+
+## 智谱AI批量接口调用注意事项
+
+### 1. JSONL 文件格式要求
+
+1. **每行必须是独立且完整的 JSON 对象**，包含以下字段：
+   ```json
+   {
+     "custom_id": "request-1",    // 必需，格式为 request-N，用于匹配结果
+     "method": "POST",            // 必需，HTTP 方法
+     "url": "/v4/chat/completions", // 必需，使用相对路径
+     "body": {
+       "model": "glm-4",         // 必需，且整个批量文件只能用同一个模型
+       "messages": [...],        // 消息数组
+       "temperature": 0.1        // 可选参数
+     }
+   }
+   ```
+
+2. **URL 格式**：
+   - ✅ 正确：使用相对路径 `/v4/chat/completions`
+   - ❌ 错误：使用完整 URL `https://open.bigmodel.cn/api/paas/v4/chat/completions`
+
+3. **模型名称**：
+   - 必须使用官方支持的模型名称
+   - 当前支持：glm-4, glm-3-turbo, glm-4-vision 等
+   - 整个批量文件中所有请求必须使用相同的模型
+
+### 2. 常见错误及解决方案
+
+1. `method 不正确: null`
+   - 原因：URL 格式不正确或包含了多余的域名
+   - 解决：使用相对路径格式
+
+2. `模型名称 xxx 和 url xxx 不匹配`
+   - 原因：使用了不支持的模型名称或 URL 格式错误
+   - 解决：检查模型名称是否在支持列表中，确保 URL 使用相对路径
+
+3. `模型名称错误`
+   - 原因：使用了未知或已停用的模型名称
+   - 解决：参考错误信息中提供的支持模型列表
+
+### 3. 最佳实践
+
+1. **文件准备**：
+   - 确保 JSONL 文件每行都是有效的 JSON
+   - 避免文件末尾有空行
+   - 使用 UTF-8 编码保存文件
+
+2. **请求构建**：
+   - 为每个请求使用递增的 request-N 格式的 custom_id
+   - 保持所有请求使用相同的模型
+   - 根据需要设置适当的 temperature 等参数
+
+3. **结果处理**：
+   - 通过 custom_id 匹配请求和响应
+   - 检查每个响应的 status_code
+   - 记录 token 使用情况
+
+### 4. 示例代码
+
+```python
+# 有效的 JSONL 文件内容示例
+{"custom_id": "request-1", "method": "POST", "url": "/v4/chat/completions", "body": {"model": "glm-4", "messages": [...], "temperature": 0.1}}
+{"custom_id": "request-2", "method": "POST", "url": "/v4/chat/completions", "body": {"model": "glm-4", "messages": [...], "temperature": 0.1}}
+```
+
+### 5. 调试建议
+
+1. 先测试单个请求是否能正常工作
+2. 使用小批量（2-3个请求）进行初始测试
+3. 成功后再扩展到更大的批量
+4. 保留详细的日志输出用于问题排查
