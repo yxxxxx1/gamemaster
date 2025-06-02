@@ -12,6 +12,7 @@ from app.models import TranslationJobRequest, TranslationJobCreateResponse, Tran
 from app.services import file_service
 from app.services import zhipu_ai_service
 from app.services.zhipu_ai_service import TaskStatus as ZhipuTaskStatus
+from app.services.tag_protection_service import TagProtectionService
 from app.core.config import settings
 import logging
 
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Global job store for this service
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
+
+# 创建TagProtectionService实例
+tag_service = TagProtectionService()
 
 # TODO: Make these configurable if necessary, potentially via settings
 ZHIPU_API_BASE_URL = "https://open.bigmodel.cn/api/paas"
@@ -82,6 +86,7 @@ async def _update_job_store_callback(
                 api_key = job_entry["zhipu_api_key"]
                 placeholders_map = job_entry["placeholders_map"]
                 chunk_details_map = job_entry["chunk_details_map"]
+                tag_maps = job_entry["tag_maps"]  # 获取标签映射
 
                 processed_results = await zhipu_ai_service.download_and_process_results(
                     api_key=api_key,
@@ -89,12 +94,18 @@ async def _update_job_store_callback(
                     chunk_details_map=chunk_details_map
                 )
 
+                # 还原翻译结果中的标签
+                restored_results = []
+                for translated_text, tag_map in zip(processed_results, tag_maps):
+                    restored_text = tag_service.restore_tags(translated_text, tag_map)
+                    restored_results.append(restored_text)
+
                 # 更新任务状态和结果
                 job_entry.update({
                     "status": AppTranslationJobStatus.COMPLETED.value,
                     "progress_percentage": 100,
-                    "aggregated_translations": processed_results,
-                    "translated_texts_count": len(processed_results),
+                    "aggregated_translations": restored_results,  # 使用还原后的结果
+                    "translated_texts_count": len(restored_results),
                     "message": "Translation completed successfully."
                 })
 
@@ -183,10 +194,11 @@ async def create_and_process_translation_job(
         "zhipu_api_key": job_request.zhipu_api_key,
         "placeholders_map": {},
         "chunk_details_map": {},
-        "zhipu_batch_id": None,  # 现在只存储一个batch_id
+        "zhipu_batch_id": None,
         "error_message": None,
         "aggregated_translations": None,
-        "message": "Job initiated."
+        "message": "Job initiated.",
+        "tag_maps": []  # 新增：存储每个文本的标签映射
     }
     JOB_STORE[job_id] = initial_job_data
 
@@ -212,11 +224,22 @@ async def create_and_process_translation_job(
             JOB_STORE[job_id].update({"status": AppTranslationJobStatus.FAILED.value, "error_message": error_msg, "updated_at": datetime.datetime.now(datetime.timezone.utc)})
             raise ValueError(error_msg)
         
-        logger.info(f"Found {len(original_texts)} texts for job: {job_id}. Calling Zhipu AI service.")
+        logger.info(f"Found {len(original_texts)} texts for job: {job_id}. Processing tags and calling Zhipu AI service.")
+        
+        # 保护所有文本中的标签
+        protected_texts = []
+        tag_maps = []
+        for text in original_texts:
+            protected_text, tag_map = tag_service.protect_tags(text)
+            protected_texts.append(protected_text)
+            tag_maps.append(tag_map)
+        
+        # 更新任务数据
+        JOB_STORE[job_id]["tag_maps"] = tag_maps
         
         # 将所有文本合并到一个批量任务中
         zhipu_response_data = await zhipu_ai_service.translate_batch(
-            texts=original_texts,
+            texts=protected_texts,  # 使用保护后的文本
             api_key=job_request.zhipu_api_key,
             source_lang=job_request.source_language,
             target_lang=job_request.target_language,

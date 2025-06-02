@@ -1,0 +1,15 @@
+SourceString
+Hello {$playerName}, welcome to the game!
+Your current HP is <color=red>100</color>
+You found [item:sword_01] in the chest
+Talk to [npc:merchant_01] to complete [quest:main_01]
+You earned [achievement:first_kill]!
+Current time: 12:34:56
+Today's date: 2024-01-01
+Your balance: ¥1,234.56
+Use /help for commands
+Click [icon:item_sword] to equip
+Color code: #FF0000
+Format: %s, %d, %.2f
+Special chars: <>{}\[]()%$#@!&*+=|\/
+Currency: $100, €200, £300, ₽400 
