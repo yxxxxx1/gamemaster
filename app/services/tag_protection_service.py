@@ -58,6 +58,37 @@ class TagProtectionService:
             name: (re.compile(pattern, re.DOTALL), priority)
             for name, (pattern, priority) in self.patterns.items()
         }
+        
+        # 定义标签类型映射
+        self.tag_type_map = {
+            "brace_variables": "variable",
+            "unity_rich_text": "rich_text",
+            "item_links": "item",
+            "npc_links": "npc",
+            "quest_links": "quest",
+            "achievement_links": "achievement",
+            "game_icons": "icon",
+            "game_commands": "command",
+            "percentage_vars": "variable",
+            "format_specifiers": "format",
+            "color_codes": "color",
+            "html_tags": "html",
+            "brackets": "bracket",
+            "parentheses": "parenthesis",
+            "quotes": "quote",
+            "currency_symbols": "currency",
+            "number_format": "number",
+            "time_format": "time",
+            "date_format": "date",
+            "special_chars": "special"
+        }
+        
+        # 定义标签优先级阈值
+        self.priority_thresholds = {
+            'high': 80,  # 高优先级标签阈值
+            'medium': 60,  # 中优先级标签阈值
+            'low': 40,  # 低优先级标签阈值
+        }
     
     def _find_non_overlapping_tags(self, text: str) -> List[TagInfo]:
         """
@@ -262,4 +293,132 @@ class TagProtectionService:
             "time_format": "匹配时间格式，如 12:34:56",
             "date_format": "匹配日期格式，如 2024-01-01"
         }
-        return descriptions.get(pattern_name) 
+        return descriptions.get(pattern_name)
+    
+    def extract_tags(self, text: str) -> list:
+        """
+        提取文本中的所有标签（包括花括号、方括号、尖括号等）。
+        返回标签字符串列表，顺序与出现顺序一致。
+        """
+        if not text:
+            return []
+            
+        tags = []
+        # 记录已处理的位置，避免重复匹配
+        processed_positions = set()
+        
+        # 1. 首先处理游戏特定标签（高优先级）
+        game_tag_patterns = {
+            'brace_variables': r'{\$.*?}',  # {$variable}
+            'item_links': r'\[item:.*?\]',  # [item:sword_01]
+            'npc_links': r'\[npc:.*?\]',    # [npc:merchant_01]
+            'quest_links': r'\[quest:.*?\]', # [quest:main_01]
+            'achievement_links': r'\[achievement:.*?\]', # [achievement:first_kill]
+            'game_icons': r'\[icon:.*?\]',  # [icon:item_sword]
+            'game_commands': r'\/[a-zA-Z]+', # /command
+        }
+        
+        for pattern_name, pattern in game_tag_patterns.items():
+            for match in re.finditer(pattern, text):
+                start, end = match.span()
+                # 检查是否与已处理的标签重叠
+                if any(start < p_end and end > p_start for p_start, p_end in processed_positions):
+                    continue
+                tag = match.group(0)
+                tags.append(tag)
+                processed_positions.add((start, end))
+        
+        # 2. 处理Unity富文本标签
+        unity_tags = []
+        for match in re.finditer(r'<([^>]+)>', text):
+            start, end = match.span()
+            # 检查是否与已处理的标签重叠
+            if any(start < p_end and end > p_start for p_start, p_end in processed_positions):
+                continue
+            tag = match.group(0)
+            # 检查是否是闭合标签
+            if tag.startswith('</'):
+                # 如果是闭合标签，检查是否有对应的开始标签
+                open_tag = tag.replace('</', '<')
+                if open_tag in unity_tags:
+                    tags.append(tag)
+                    processed_positions.add((start, end))
+            else:
+                unity_tags.append(tag)
+                tags.append(tag)
+                processed_positions.add((start, end))
+        
+        # 3. 处理格式化标签（中优先级）
+        format_patterns = {
+            'percentage_vars': r'%%[^%]*%%',   # %%variable%%
+            'format_specifiers': r'%[\d\.]*[sdfeEgGxXoc]',  # %s, %d, %.2f等
+            'color_codes': r'#[0-9a-fA-F]{6}', # #FF0000
+        }
+        
+        for pattern_name, pattern in format_patterns.items():
+            for match in re.finditer(pattern, text):
+                start, end = match.span()
+                # 检查是否与已处理的标签重叠
+                if any(start < p_end and end > p_start for p_start, p_end in processed_positions):
+                    continue
+                tag = match.group(0)
+                tags.append(tag)
+                processed_positions.add((start, end))
+        
+        # 4. 处理通用标签（低优先级）
+        general_patterns = {
+            'html_tags': r'<[^>]+>',        # <tag>
+            'brackets': r'\[.*?\]',         # [text]
+            'parentheses': r'\(.*?\)',      # (text)
+            'quotes': r'[\'"].*?[\'"]',     # 'text' or "text"
+        }
+        
+        for pattern_name, pattern in general_patterns.items():
+            for match in re.finditer(pattern, text):
+                start, end = match.span()
+                # 检查是否与已处理的标签重叠
+                if any(start < p_end and end > p_start for p_start, p_end in processed_positions):
+                    continue
+                tag = match.group(0)
+                tags.append(tag)
+                processed_positions.add((start, end))
+        
+        # 按在原文中的顺序排序
+        tags.sort(key=lambda x: text.find(x))
+        return tags
+
+    def _evaluate_tag_preservation(self, source_text: str, translated_text: str) -> Tuple[float, List[str]]:
+        """评估标签保留情况"""
+        issues = []
+        
+        # 提取源文本中的标签
+        source_tags = self.extract_tags(source_text)
+        translated_tags = self.extract_tags(translated_text)
+        
+        # 检查标签是否完整保留
+        if len(source_tags) != len(translated_tags):
+            issues.append(f"标签数量不匹配: 源文本 {len(source_tags)} 个, 翻译后 {len(translated_tags)} 个")
+            return 0.0, issues
+        
+        # 检查标签内容是否一致
+        for src_tag, trans_tag in zip(source_tags, translated_tags):
+            # 对于游戏标签，只比较标签类型和ID
+            if re.match(r'\[(item|npc|quest|location|achievement):.*?\]', src_tag):
+                src_type = re.match(r'\[(.*?):', src_tag).group(1)
+                trans_type = re.match(r'\[(.*?):', trans_tag).group(1)
+                if src_type != trans_type:
+                    issues.append(f"标签类型不一致: {src_tag} -> {trans_tag}")
+            # 对于Unity富文本标签，检查标签类型和属性
+            elif re.match(r'<\/?(b|i|size|color|material|quad|sprite|link|nobr|page|indent|align|mark|mspace|width|style|gradient|cspace|font|voffset|line-height|pos|space|noparse|uppercase|lowercase|smallcaps|sup|sub)(=[^>]*)?>', src_tag):
+                src_type = re.match(r'<\/?([a-zA-Z]+)', src_tag).group(1)
+                trans_type = re.match(r'<\/?([a-zA-Z]+)', trans_tag).group(1)
+                if src_type != trans_type:
+                    issues.append(f"标签类型不一致: {src_tag} -> {trans_tag}")
+            # 对于其他标签，严格比较
+            else:
+                if src_tag != trans_tag:
+                    issues.append(f"标签内容不一致: {src_tag} -> {trans_tag}")
+        
+        # 计算得分：如果没有问题，得分为100；每有一个问题扣20分
+        score = 100.0 if not issues else max(0.0, 100.0 - (len(issues) * 20.0))
+        return score, issues 

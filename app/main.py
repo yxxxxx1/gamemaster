@@ -8,6 +8,7 @@ from .core.config import settings
 from .routers import files as files_router # Changed to import the module
 from .routers import jobs as jobs_router # Added import for jobs_router
 from .routers import config_api as config_router # Corrected import to use config_api
+from .routers import quality as quality_router # Added import for quality_router
 # from .routers import config_api_router
 # from .models import ErrorResponse # For custom error responses if needed
 
@@ -49,6 +50,7 @@ async def read_root():
 app.include_router(files_router.router, prefix=f"{settings.API_V1_STR}/files", tags=["File Operations"])
 app.include_router(jobs_router.router, prefix=f"{settings.API_V1_STR}/translation-jobs", tags=["Translation Jobs"])
 app.include_router(config_router.router, prefix=settings.API_V1_STR + "/config", tags=["Configuration"])
+app.include_router(quality_router.router, prefix=settings.API_V1_STR + "/quality", tags=["Translation Quality"])
 
 
 # --- CORS Middleware (Uncomment and configure if needed for your frontend) ---
