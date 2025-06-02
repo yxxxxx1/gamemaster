@@ -1,9 +1,10 @@
 import datetime
 import uuid
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import asyncio
 import traceback
+import time
 
 from fastapi import HTTPException, status, BackgroundTasks, UploadFile
 
@@ -12,6 +13,9 @@ from app.services import file_service
 from app.services import zhipu_ai_service
 from app.services.zhipu_ai_service import TaskStatus as ZhipuTaskStatus
 from app.core.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Global job store for this service
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
@@ -28,252 +32,282 @@ MAX_POLLING_ATTEMPTS = 120     # 120 attempts × 10 seconds = 1200 seconds = 20 
 # Standard model if not specified by user or if batch API has a default
 DEFAULT_ZHIPU_MODEL = "glm-4"
 
+def _parse_custom_id_for_sorting(custom_id: str) -> Tuple[int, int]:
+    """
+    Parses custom_id like 'request_jobId_chunk_CHUNKIDX_LINEIDX' into (CHUNKIDX, LINEIDX) for sorting.
+    Returns (float('inf'), float('inf')) on failure to parse, pushing malformed IDs to the end.
+    """
+    try:
+        # Find "chunk_" and then extract indices. This is more robust to job_id containing underscores.
+        parts = custom_id.split("_")
+        chunk_keyword_idx = -1
+        # Iterate to find "chunk" as job_id itself might have underscores
+        for i, part_val in enumerate(parts):
+            if part_val == "chunk" and i + 2 < len(parts): # Need two more parts for chunk_idx and line_idx
+                chunk_keyword_idx = i
+                break
+        
+        if chunk_keyword_idx != -1:
+            chunk_idx = int(parts[chunk_keyword_idx + 1])
+            line_idx = int(parts[chunk_keyword_idx + 2])
+            return chunk_idx, line_idx
+        else:
+            logger.warning(f"Could not parse chunk and line indices from custom_id: {custom_id} - 'chunk' keyword not found or insufficient parts.")
+            return (float('inf'), float('inf'))
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Error parsing custom_id '{custom_id}' for sorting: {e}")
+        return (float('inf'), float('inf'))
+
 async def _update_job_store_callback(
-    job_id: str, 
+    main_job_id: str, 
     status_from_zhipu: ZhipuTaskStatus, 
+    zhipu_batch_id: str,
     **kwargs: Any
 ) -> None:
-    """Callback function to be invoked by zhipu_ai_service to update JOB_STORE."""
-    print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: Received update for job_id '{job_id}'. Status: {status_from_zhipu}. Kwargs: {kwargs}")
-    if job_id not in JOB_STORE:
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: ERROR - Job ID '{job_id}' not found in JOB_STORE. Ignoring callback.")
+    logger.info(f"TJS_CALLBACK: Received update for MainJobId '{main_job_id}', ZhipuBatchID '{zhipu_batch_id}'. Status: {status_from_zhipu}. Kwargs: {kwargs}")
+    if main_job_id not in JOB_STORE:
+        logger.error(f"TJS_CALLBACK: ERROR - MainJobId '{main_job_id}' not found in JOB_STORE. Ignoring callback for ZhipuBatchID '{zhipu_batch_id}'.")
         return
 
-    job_entry = JOB_STORE[job_id]
+    job_entry = JOB_STORE[main_job_id]
     job_entry["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
 
-    # Map ZhipuTaskStatus to AppTranslationJobStatus if needed, or ensure consistency
-    # For now, let's assume direct usage or a mapping step
-    job_entry["status"] = status_from_zhipu.value # Store the string value of the enum
-
-    if "progress" in kwargs:
-        job_entry["progress_percentage"] = kwargs["progress"]
-    
-    if "error" in kwargs:
-        job_entry["error_message"] = kwargs["error"]
-        job_entry["status"] = AppTranslationJobStatus.FAILED.value # Ensure our app status reflects failure
-
-    if "zhipu_batch_id" in kwargs: # Store the actual zhipu batch id for reference
-        job_entry["zhipu_batch_id_actual"] = kwargs["zhipu_batch_id"]
-
+    # 更新任务状态
     if status_from_zhipu == ZhipuTaskStatus.COMPLETED:
-        translations = kwargs.get("result")
-        if translations:
-            job_entry["translations"] = translations # Store raw translations
-            job_entry["translated_texts_count"] = len(translations)
-            job_entry["status"] = AppTranslationJobStatus.COMPLETED.value # Final app status
-            job_entry["progress_percentage"] = 100
-            
-            print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: Job '{job_id}' completed. Translations count: {len(translations)}.")
-            
-            # Attempt to write results to Excel
+        zhipu_output_file_id = kwargs.get("zhipu_output_file_id")
+        if zhipu_output_file_id:
+            logger.info(f"TJS_CALLBACK: ZhipuBatchID '{zhipu_batch_id}' (MainJobId '{main_job_id}') completed. Output File ID: {zhipu_output_file_id}. Downloading results.")
             try:
-                request_details = job_entry.get("request_details", {})
-                original_file_id = request_details.get("file_id")
-                original_file_path_str = job_entry.get("file_path_processed") # Path of the uploaded source file
-                
-                if original_file_path_str and original_file_id: # Ensure we have the path
-                    original_file_path = Path(original_file_path_str)
-                    original_text_col = request_details.get("original_text_column", "original_text") # Default if not in request
-                    translated_text_col_name = request_details.get("translated_text_column_name", "translated_text")
-                    project_name = request_details.get("project_name")
+                # 获取必要的映射和API密钥
+                api_key = job_entry["zhipu_api_key"]
+                placeholders_map = job_entry["placeholders_map"]
+                chunk_details_map = job_entry["chunk_details_map"]
+
+                processed_results = await zhipu_ai_service.download_and_process_results(
+                    api_key=api_key,
+                    output_file_id=zhipu_output_file_id,
+                    chunk_details_map=chunk_details_map
+                )
+
+                # 更新任务状态和结果
+                job_entry.update({
+                    "status": AppTranslationJobStatus.COMPLETED.value,
+                    "progress_percentage": 100,
+                    "aggregated_translations": processed_results,
+                    "translated_texts_count": len(processed_results),
+                    "message": "Translation completed successfully."
+                })
+
+                # 写入Excel文件
+                try:
+                    request_details = job_entry.get("request_details", {})
+                    original_file_id = request_details.get("file_id")
+                    original_file_path_str = job_entry.get("file_path_processed")
                     
-                    print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: Attempting to write translated Excel for job '{job_id}'.")
-                    # This function needs to be implemented in file_service or here
-                    # It should take the original file, add/update a column with translations, and save as a new file.
-                    output_file_path = await file_service.write_excel_with_translations(
-                        original_file_path=original_file_path,
-                        translations=translations,
-                        original_text_column_name=original_text_col,
-                        new_translated_column_name=translated_text_col_name,
-                        project_name=project_name, # Optional, for naming output file
-                        base_filename_suffix="_translated"
-                    )
-                    job_entry["output_file_path"] = str(output_file_path)
-                    print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: Translated Excel saved for job '{job_id}' at: {output_file_path}")
-                else:
-                    print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: WARNING - Could not write translated Excel for job '{job_id}'. Missing original_file_path or file_id.")
-                    existing_error_message_path = job_entry.get("error_message") or ""
-                    new_error_part_path = "Results obtained, but failed to write output Excel file due to missing path info."
-                    if existing_error_message_path:
-                        job_entry["error_message"] = (existing_error_message_path + "; " + new_error_part_path).strip()
+                    if original_file_path_str and original_file_id:
+                        output_file_path = await file_service.write_excel_with_translations(
+                            original_file_path=Path(original_file_path_str),
+                            translations=job_entry["aggregated_translations"],
+                            original_text_column_name=request_details.get("original_text_column", "original_text"),
+                            new_translated_column_name=request_details.get("translated_text_column_name", "translated_text"),
+                            project_name=request_details.get("project_name"),
+                            base_filename_suffix="_translated"
+                        )
+                        job_entry["output_file_path"] = str(output_file_path)
+                        logger.info(f"TJS_CALLBACK: Translated Excel saved for MainJobId '{main_job_id}' at: {output_file_path}")
                     else:
-                        job_entry["error_message"] = new_error_part_path.strip()
-                    # Optionally, do not mark as fully FAILED if translations are available but file write failed.
-                    # job_entry["status"] = AppTranslationJobStatus.COMPLETED_WITH_ISSUES.value # If you add such a status
+                        logger.warning(f"TJS_CALLBACK: Could not write Excel for MainJobId '{main_job_id}'. Missing path info.")
+                        job_entry["error_message"] = "Failed to write output Excel (missing path)."
+                except Exception as e_write_excel:
+                    logger.error(f"TJS_CALLBACK: ERROR writing Excel for MainJobId '{main_job_id}': {e_write_excel}", exc_info=True)
+                    job_entry["error_message"] = f"Failed to write output Excel: {e_write_excel}"
+                    job_entry["status"] = AppTranslationJobStatus.COMPLETED_WITH_ISSUES.value
 
-            except Exception as e_write:
-                print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: ERROR writing translated Excel for job '{job_id}': {type(e_write).__name__} - {e_write}")
-                traceback.print_exc()
-                existing_error_message = job_entry.get("error_message") or ""
-                new_error_write = f"Results obtained, but failed to write output Excel file: {e_write}"
-                if existing_error_message:
-                    job_entry["error_message"] = (existing_error_message + "; " + new_error_write).strip()
-                else:
-                    job_entry["error_message"] = new_error_write.strip()
-                # Mark as FAILED or a special status if file writing is critical
-                job_entry["status"] = AppTranslationJobStatus.FAILED.value # Or COMPLETED_WITH_ERRORS
+            except Exception as e_download:
+                logger.error(f"TJS_CALLBACK: ERROR downloading/processing results for ZhipuBatchID '{zhipu_batch_id}': {e_download}", exc_info=True)
+                job_entry.update({
+                    "status": AppTranslationJobStatus.FAILED.value,
+                    "error_message": f"Failed to download/process results: {e_download}"
+                })
         else:
-            print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: Job '{job_id}' reported as COMPLETED by Zhipu, but no results found in callback kwargs.")
-            job_entry["status"] = AppTranslationJobStatus.FAILED.value
-            job_entry["error_message"] = "Zhipu reported task completion, but translation results were missing."
-            job_entry["progress_percentage"] = 100 # It did complete on Zhipu side
-
-    elif status_from_zhipu == ZhipuTaskStatus.FAILED:
-        job_entry["status"] = AppTranslationJobStatus.FAILED.value
-        if "error" not in job_entry or not job_entry["error"] : # If zhipu_service didn't already set it
-             job_entry["error_message"] = kwargs.get("error", "Zhipu AI task failed without specific details.")
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: Job '{job_id}' FAILED. Error: {job_entry['error_message']}")
+            logger.warning(f"TJS_CALLBACK: ZhipuBatchID '{zhipu_batch_id}' completed but no zhipu_output_file_id provided.")
+            job_entry.update({
+                "status": AppTranslationJobStatus.FAILED.value,
+                "error_message": "Zhipu batch completed but no output_file_id found"
+            })
     
-    print(f"[{datetime.datetime.now(datetime.timezone.utc)}] TJS_CALLBACK: JOB_STORE updated for '{job_id}': Status='{job_entry['status']}', Progress={job_entry.get('progress_percentage')}")
+    elif status_from_zhipu == ZhipuTaskStatus.FAILED:
+        error_msg = kwargs.get("error", "Unknown error")
+        job_entry.update({
+            "status": AppTranslationJobStatus.FAILED.value,
+            "error_message": f"Translation failed: {error_msg}"
+        })
+        logger.warning(f"TJS_CALLBACK: ZhipuBatchID '{zhipu_batch_id}' (MainJobId '{main_job_id}') FAILED. Error: {error_msg}")
+    
+    elif status_from_zhipu == ZhipuTaskStatus.PROCESSING:
+        progress = kwargs.get("progress", 0)
+        job_entry.update({
+            "status": AppTranslationJobStatus.PROCESSING.value,
+            "progress_percentage": progress,
+            "message": f"Translation in progress: {progress}%"
+        })
+        logger.info(f"TJS_CALLBACK: MainJobId '{main_job_id}' progress: {progress}%")
+
+    logger.info(f"TJS_CALLBACK: JOB_STORE updated for MainJobId '{main_job_id}': Status='{job_entry['status']}', Progress={job_entry.get('progress_percentage')}%")
 
 async def create_and_process_translation_job(
     job_request: TranslationJobRequest,
     background_tasks: BackgroundTasks
 ) -> TranslationJobCreateResponse:
-    """创建并处理翻译任务"""
     job_id = str(uuid.uuid4())
     current_time = datetime.datetime.now(datetime.timezone.utc)
 
-    # Ensure ZHIPU_API_KEY is available from settings
     if not settings.ZHIPU_API_KEY:
-        print("[translation_job_service] CRITICAL ERROR: ZHIPU_API_KEY is not configured.")
-        # This should ideally be caught by the router/endpoint layer, but good to have a check.
+        logger.critical("CRITICAL ERROR: ZHIPU_API_KEY is not configured.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Server configuration error: Zhipu AI API Key is not set."
         )
 
-    # Initialize JOB_STORE entry
     initial_job_data = {
         "job_id": job_id,
         "status": AppTranslationJobStatus.PENDING.value,
-        "request_details": job_request.model_dump(), # Original request details
-        "file_path_processed": None, # Path to the originally uploaded file after saving
-        "output_file_path": None,    # Path to the new Excel file with translations
+        "request_details": job_request.model_dump(),
+        "file_path_processed": None,
+        "output_file_path": None,
         "original_texts_count": 0,
         "translated_texts_count": 0,
         "progress_percentage": 0,
         "created_at": current_time,
         "updated_at": current_time,
-        "zhipu_batch_id_actual": None, # To store the actual batch ID from Zhipu
+        "zhipu_api_key": job_request.zhipu_api_key,
+        "placeholders_map": {},
+        "chunk_details_map": {},
+        "zhipu_batch_id": None,  # 现在只存储一个batch_id
         "error_message": None,
-        "translations": None, # Store the list of translated strings
+        "aggregated_translations": None,
         "message": "Job initiated."
     }
     JOB_STORE[job_id] = initial_job_data
 
     try:
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] Starting job: {job_id} for file_id: {job_request.file_id}, original_filename: {job_request.original_filename}")
+        logger.info(f"Starting job: {job_id} for file_id: {job_request.file_id}, original_filename: {job_request.original_filename}")
         
-        # 1. Get file path and read Excel content
         file_path = await file_service.get_file_path(job_request.file_id)
         if not file_path or not await asyncio.to_thread(Path(file_path).exists):
-            JOB_STORE[job_id]["status"] = AppTranslationJobStatus.FAILED.value
-            JOB_STORE[job_id]["error_message"] = f"Uploaded file not found for file_id: {job_request.file_id}"
-            JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=JOB_STORE[job_id]["error_message"])
+            error_msg = f"Uploaded file not found for file_id: {job_request.file_id}"
+            JOB_STORE[job_id].update({"status": AppTranslationJobStatus.FAILED.value, "error_message": error_msg, "updated_at": datetime.datetime.now(datetime.timezone.utc)})
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error_msg)
         
         JOB_STORE[job_id]["file_path_processed"] = str(file_path)
-        JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
         
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] Reading Excel for job: {job_id} from path: {file_path}")
         original_texts = await file_service.read_excel_column(
             file_path=file_path,
             column_identifier=job_request.original_text_column
         )
         JOB_STORE[job_id]["original_texts_count"] = len(original_texts)
-        JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
 
         if not original_texts:
-            JOB_STORE[job_id]["status"] = AppTranslationJobStatus.FAILED.value
-            JOB_STORE[job_id]["error_message"] = "No texts found in the specified column."
-            JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-            # No need to raise HTTPException here if we return a proper response later, but for now it's fine.
-            print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] Job {job_id} failed: No texts found.")
-            # The calling router will likely catch this if it expects a specific structure
-            # For now, this will bubble up as an exception handled by the generic exception handler below if not caught by API layer.
-            # Consider returning a specific error response if create_translation_job is called directly not from router
-            raise ValueError("No texts found in the specified column of the Excel file.") # Raise ValueError to be caught by specific handler
+            error_msg = "No texts found in the specified column."
+            JOB_STORE[job_id].update({"status": AppTranslationJobStatus.FAILED.value, "error_message": error_msg, "updated_at": datetime.datetime.now(datetime.timezone.utc)})
+            raise ValueError(error_msg)
         
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] Found {len(original_texts)} texts for job: {job_id}. Calling Zhipu AI.")
+        logger.info(f"Found {len(original_texts)} texts for job: {job_id}. Calling Zhipu AI service.")
         
-        # 2. Call Zhipu AI service with callback
-        zhipu_submission_info = await zhipu_ai_service.translate_batch(
+        # 将所有文本合并到一个批量任务中
+        zhipu_response_data = await zhipu_ai_service.translate_batch(
             texts=original_texts,
-            api_key=job_request.zhipu_api_key, # This should come from job_request or settings
+            api_key=job_request.zhipu_api_key,
             source_lang=job_request.source_language,
             target_lang=job_request.target_language,
             model=job_request.model or zhipu_ai_service.DEFAULT_ZHIPU_MODEL,
-            main_job_id=job_id,  # Correctly passing main_job_id
-            update_callback=_update_job_store_callback # Correctly passing the callback
+            main_job_id=job_id,
+            texts_per_chunk=job_request.texts_per_chunk
         )
 
-        # 3. Update JOB_STORE with Zhipu submission details
-        JOB_STORE[job_id]["zhipu_batch_id_actual"] = zhipu_submission_info.get("zhipu_batch_id")
-        # Initial status update after submission, background task will provide further updates
-        # The first callback from background_poll_status will set it to PROCESSING with progress
-        # So, we can keep it PENDING or set to a specific "SUBMITTED_TO_ZHIPU" status if desired.
-        # For now, let's rely on the first callback to set it to PROCESSING.
-        # JOB_STORE[job_id]["status"] = AppTranslationJobStatus.PROCESSING.value 
-        JOB_STORE[job_id]["message"] = zhipu_submission_info.get("message", "Task submitted to Zhipu AI for processing.")
-        JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] Zhipu AI Batch ID {JOB_STORE[job_id]['zhipu_batch_id_actual']} submitted for job: {job_id}. Waiting for callback.")
+        zhipu_batch_id = zhipu_response_data.get("batch_job_id")  # 现在只获取一个batch_id
+        placeholders_map = zhipu_response_data.get("placeholders_map", {})
+        chunk_details_map = zhipu_response_data.get("chunk_details_map", {})
+
+        if not zhipu_batch_id:
+            error_msg = "Zhipu AI service did not return a batch job ID."
+            JOB_STORE[job_id].update({"status": AppTranslationJobStatus.FAILED.value, "error_message": error_msg, "updated_at": datetime.datetime.now(datetime.timezone.utc)})
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg)
+
+        JOB_STORE[job_id].update({
+            "placeholders_map": placeholders_map,
+            "chunk_details_map": chunk_details_map,
+            "zhipu_batch_id": zhipu_batch_id,
+            "status": AppTranslationJobStatus.PROCESSING.value,
+            "message": "Batch job submitted to Zhipu AI for processing. Polling started.",
+            "updated_at": datetime.datetime.now(datetime.timezone.utc)
+        })
+
+        # 启动单个后台轮询任务
+        background_tasks.add_task(
+            zhipu_ai_service.background_poll_status,
+            main_job_id=job_id,
+            zhipu_batch_id=zhipu_batch_id,
+            api_key=job_request.zhipu_api_key,
+            update_callback=_update_job_store_callback
+        )
+        logger.info(f"Job {job_id}: Started background polling task for Zhipu batch ID: {zhipu_batch_id}")
 
         return TranslationJobCreateResponse(
             job_id=job_id,
-            status=JOB_STORE[job_id]["status"], # Return current status, likely PENDING or as set by initial callback if fast enough
+            status=JOB_STORE[job_id]["status"],
             message=JOB_STORE[job_id]["message"],
             created_at=initial_job_data["created_at"],
-            # details_url can be constructed here if your router structure is fixed
         )
 
-    except ValueError as ve: # Catch specific ValueError from no texts found
+    except ValueError as ve:
         if job_id in JOB_STORE:
-            JOB_STORE[job_id]["status"] = AppTranslationJobStatus.FAILED.value
-            JOB_STORE[job_id]["error_message"] = str(ve)
-            JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] ValueError in create_and_process_translation_job for job {job_id}: {ve}")
-        # This will be caught by the router if it calls this function
+            JOB_STORE[job_id].update({"status": AppTranslationJobStatus.FAILED.value, "error_message": str(ve), "updated_at": datetime.datetime.now(datetime.timezone.utc)})
+        logger.warning(f"ValueError in create_and_process_translation_job for job {job_id}: {ve}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
 
-    except HTTPException as http_exc: # Catch HTTPExceptions from zhipu_ai_service or file_service
+    except HTTPException as http_exc:
         if job_id in JOB_STORE:
-            JOB_STORE[job_id]["status"] = AppTranslationJobStatus.FAILED.value
-            JOB_STORE[job_id]["error_message"] = http_exc.detail
-            JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] HTTPException in create_and_process_translation_job for job {job_id}: {http_exc.detail}")
-        raise http_exc # Re-raise to be handled by the API router
+            JOB_STORE[job_id].update({"status": AppTranslationJobStatus.FAILED.value, "error_message": http_exc.detail, "updated_at": datetime.datetime.now(datetime.timezone.utc)})
+        logger.warning(f"HTTPException in create_and_process_translation_job for job {job_id}: {http_exc.detail}", exc_info=True)
+        raise http_exc
     
     except Exception as e:
-        error_message_detail = f"An unexpected error occurred in TJS: {type(e).__name__} - {str(e)}"
+        error_message_detail = f"An unexpected error occurred in TJS create_and_process: {type(e).__name__} - {str(e)}"
         if job_id in JOB_STORE:
-            JOB_STORE[job_id]["status"] = AppTranslationJobStatus.FAILED.value
-            JOB_STORE[job_id]["error_message"] = error_message_detail
-            JOB_STORE[job_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-        
-        print(f"[{datetime.datetime.now(datetime.timezone.utc)}] [translation_job_service] Error in create_and_process_translation_job for job {job_id}: {error_message_detail}")
-        traceback.print_exc()
+            JOB_STORE[job_id].update({"status": AppTranslationJobStatus.FAILED.value, "error_message": error_message_detail, "updated_at": datetime.datetime.now(datetime.timezone.utc)})
+        logger.error(f"Error in create_and_process_translation_job for job {job_id}: {error_message_detail}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process translation job due to an internal server error: {error_message_detail}"
+            detail=error_message_detail
         )
 
 async def get_translation_job_status(job_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves the status and data of a translation job from the in-memory store."""
     return JOB_STORE.get(job_id)
 
 async def get_translation_job_status_for_api(job_id: str) -> Optional[Dict[str, Any]]:
-    """Helper to retrieve job status, to be called by the router.
-       Formats the response slightly, e.g., ensuring datetime is isoformat.
-    """
     job_data = JOB_STORE.get(job_id)
     if job_data:
-        # Ensure datetimes are in a consistent string format for the API response if not already
-        # This is more relevant if JOB_STORE stores actual datetime objects that need serialization
-        # For now, assuming they are already ISO strings or will be handled by Pydantic model if one is used for response.
-        return job_data 
+        # Create a copy to avoid modifying JOB_STORE directly if further processing is done here
+        response_data = job_data.copy()
+        # Ensure datetimes are ISO strings if they are datetime objects
+        for key in ["created_at", "updated_at"]:
+            if isinstance(response_data.get(key), datetime.datetime):
+                response_data[key] = response_data[key].isoformat()
+        
+        # Optionally, simplify or prune what's returned to the API
+        # For example, 'placeholders_map' or 'chunk_details_map' might be too large or internal.
+        # 'aggregated_translations' might also be too large for a status check; usually a separate download endpoint for results.
+        # For now, returning most of it for debugging.
+        # Consider removing or summarizing large fields like 'aggregated_translations', 'placeholders_map' for API status.
+        # response_data.pop("placeholders_map", None)
+        # response_data.pop("chunk_details_map", None)
+        # if response_data.get("aggregated_translations"):
+        #    response_data["message"] += " Translations are available." # Indicate availability without sending all data
+        #    response_data.pop("aggregated_translations")
+
+
+        return response_data
     return None
 
 # We will add functions later to:

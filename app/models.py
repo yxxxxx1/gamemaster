@@ -64,6 +64,13 @@ class TranslationJobRequest(APIBaseModel):
         example="My Game Localization Project v1"
     )
     model: Optional[str] = Field(None, description="Optional Zhipu AI model name to be used for translation. Defaults to the system default if not provided.")
+    texts_per_chunk: Optional[int] = Field(
+        default=None, # If None, service will use global config or a hardcoded default
+        ge=1, 
+        le=200, # Example limits, adjust as needed for Zhipu API
+        description="Optional: Number of text lines to bundle into a single sub-request within a Zhipu batch job. "
+                    "Overrides server default if provided. Affects API call frequency and data per call."
+    )
     # We might add custom_glossary later if needed, keeping it simple for now as per initial doc.
     # custom_glossary: Optional[Dict[str, str]] = Field(
     #     default=None,
@@ -89,6 +96,7 @@ class TranslationJobRequest(APIBaseModel):
 # --- Enum for Job Status --- 
 class TranslationJobStatus(str, enum.Enum):
     PENDING = "pending"      # 新增：任务已创建，等待处理
+    PROCESSING = "processing"  # 新增：任务正在处理中
     PROCESSING_CHUNKS = "processing_chunks"  # New status: Main job is actively managing/waiting for chunks
     COMPLETED = "completed"    # 任务已成功完成
     COMPLETED_WITH_ERRORS = "completed_with_errors"  # New status: If some chunks failed but others succeeded

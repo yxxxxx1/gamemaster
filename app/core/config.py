@@ -1,7 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import os
 from pathlib import Path
-from typing import Optional # Added for ZHIPU_API_KEY
+from typing import Optional # Field will be imported from pydantic
+from pydantic import Field # Import Field from pydantic
 
 class Settings(BaseSettings):
     APP_NAME: str = "AI Game Localization File Translation Tool"
@@ -13,9 +14,15 @@ class Settings(BaseSettings):
     OUTPUT_FILES_DIR: Path = PROJECT_ROOT_DIR / "app" / "output_files" # Added output directory
     SERVER_HOST: Optional[str] = "http://localhost:8000" # Added for constructing full URLs
 
-    # Optional: Load ZHIPU_API_KEY directly from environment if you prefer
-    # This allows it to be None if not set, and you can handle it in your service layer
-    ZHIPU_API_KEY: str 
+    # Example: "http://localhost:3000,http://127.0.0.1:3000"
+    BACKEND_CORS_ORIGINS_CSV: str = Field(default="")
+
+    # --- Zhipu AI Specific Settings ---
+    ZHIPU_API_KEY: Optional[str] = Field(default=None, env="ZHIPU_API_KEY")
+    # New: Number of text lines to bundle into a single request in a Zhipu batch job
+    ZHIPU_TEXTS_PER_CHUNK: int = Field(default=10, ge=1, le=100) # Default 10, Min 1, Max 100 (example limits)
+    ZHIPU_HTTP_TIMEOUT: float = Field(default=60.0, ge=10.0) # HTTP timeout for Zhipu client requests in seconds
+    ZHIPU_TEMPERATURE: float = Field(default=0.1, ge=0.0, le=1.0) # Temperature for Zhipu model
 
     # Create directories if they don't exist when settings are loaded
     def __init__(self, **values):

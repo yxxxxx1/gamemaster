@@ -41,7 +41,12 @@ async def create_translation_job(
     source_lang: str = Form("en", description="Source language code (e.g., 'en')."),
     target_lang: str = Form("zh", description="Target language code (e.g., 'zh')."),
     project_name: Optional[str] = Form(None, description="Optional name for the translation project."),
-    # tag_patterns 也可以作为 Form 字段接受，例如作为 JSON 编码的字符串列表
+    texts_per_chunk: Optional[int] = Form(
+        default=None, 
+        ge=1, 
+        le=200, # Match model limits
+        description="Optional: Number of lines per chunk for Zhipu batch processing. Uses server default if not provided."
+    )
 ):
     """
     Creates a new translation job based on a `file_id` from a previous upload.
@@ -55,25 +60,21 @@ async def create_translation_job(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Server configuration error: Zhipu AI API Key is not set. Please contact the administrator."
             )
-
-        # 注意：这里不再调用 save_uploaded_file，因为文件应该已经通过 /files/upload 上传了。
-        # 我们需要确保 file_service.get_file_path(file_id) 能够正确工作。
-        # TranslationJobRequest 现在需要 file_id 和 original_filename（如果模型需要）。
         
         job_request = TranslationJobRequest(
             file_id=file_id, 
-            original_filename=original_filename, # 从 Form 参数获取
+            original_filename=original_filename, 
             original_text_column=original_text_column,
             translated_text_column_name=translated_text_column_name, 
             source_language=source_lang,
             target_language=target_lang,
             zhipu_api_key=settings.ZHIPU_API_KEY, 
-            project_name=project_name 
-            # tag_patterns 也可以在这里根据需要从请求中填充
+            project_name=project_name,
+            # model and tag_patterns will use defaults from Pydantic model if not passed via Form
+            # texts_per_chunk will be handled by service layer using global config
+            texts_per_chunk=texts_per_chunk # Assign the form value to the model field
         )
         
-        # create_and_process_translation_job 服务函数现在将使用 job_request 中的 file_id 
-        # 来通过 file_service.get_file_path 获取文件路径。
         job_response = await translation_job_service.create_and_process_translation_job(
             job_request=job_request,
             background_tasks=background_tasks
@@ -89,16 +90,13 @@ async def create_translation_job(
                      job_response.details_url = None
             return job_response
         else:
-            # 这个分支理论上不应该被到达，因为 service 层应该抛出异常
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create translation job due to an unexpected error in the service layer."
             )
     except HTTPException as http_exc:
-        # 直接重新抛出已知的 HTTP 异常
         raise http_exc
     except Exception as e:
-        # 捕获其他所有意外错误
         print(f"Unexpected error in create_translation_job endpoint: {type(e).__name__} - {str(e)}")
         traceback.print_exc()
         raise HTTPException(
@@ -188,19 +186,15 @@ async def download_translated_file(
 
     output_file_path = Path(output_file_path_str)
     if not output_file_path.exists() or not output_file_path.is_file():
-        # This case might indicate an issue post-generation or a cleanup, log it.
         print(f"Error: Output file path found in job store for job '{job_id}' but file does not exist at '{output_file_path}'.")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Translated file for job ID '{job_id}' seems to be missing from the server.")
 
-    # Determine filename for download (e.g., original_filename_translated.xlsx or job_id_translated.xlsx)
-    # For now, use the job_id as the base name for the downloaded file.
     original_filename_base = "translated_output"
     try:
-        # Try to get a more descriptive name if original request details are available
         original_filename = job_data.get("request_details", {}).get("original_filename", f"job_{job_id}_translated.xlsx")
         original_filename_base = Path(original_filename).stem
     except Exception:
-        pass # Stick to default if any issue
+        pass 
         
     download_filename = f"{original_filename_base}_{job_id}_translated.xlsx"
 

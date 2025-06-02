@@ -244,6 +244,19 @@ RESTful 风格。
 响应：{ "file_id": "string", "filename": "string" }
 4.2 翻译任务创建与启动接口 (POST /api/v1/translation-jobs)
 请求 (JSON):
+{
+  "file_id": "string",             // 必需，已上传文件的ID
+  "original_filename": "string",   // 必需，原始文件名 (用于确认)
+  "source_language": "string",     // 必需，源语言代码 (例如 "en")
+  "target_language": "string",     // 必需，目标语言代码 (例如 "zh")
+  "original_text_column": "string",// 必需，原文所在列的标识符 (例如 "A" 或 "Source Text")
+  "translated_text_column_name": "string", // 必需，翻译后新列的名称
+  "zhipu_api_key": "string",       // 必需，智谱AI的API Key (通常应在服务器端配置，但此处为方便测试允许客户端传入)
+  "tag_patterns": ["string"],      // 可选，自定义标签正则表达式列表
+  "project_name": "string",        // 可选，项目名称
+  "model": "string",               // 可选，智谱AI模型名称 (例如 "glm-4")
+  "texts_per_chunk": "integer"     // 可选，表单字段：每个智谱AI批量子请求的文本行数 (例如 10)。如果未提供，则使用服务器默认配置。
+}
 响应：{ "job_id": "string", "status": "queued" }
 后端处理： 接收任务后，将通过 Celery 异步执行。工作者进程会读取 file_id 对应的文件，提取文本，应用标签保护，然后调用智谱的批量翻译API。
 4.3 翻译任务状态查询接口 (GET /api/v1/translation-jobs/{job_id}/status)
@@ -330,6 +343,18 @@ CI/CD： 考虑使用 Jenkins, GitLab CI, GitHub Actions 实现自动化构建�
 
 API接口测试地址： http://127.0.0.1:8000/api/v1/docs
 重启服务命令：uvicorn app.main:app --reload
+
+## 配置文件 (.env 和 app/core/config.py)
+
+除了通过API请求传递必要的参数（如智谱API Key），部分行为也可以通过环境变量和配置文件进行控制。
+
+### 关键配置项 (app/core/config.py)
+
+-   `APP_NAME`: 应用名称。
+-   `API_V1_STR`: API版本前缀，默认为 `/api/v1`。
+-   `TEMP_FILES_DIR`: 用于存储上传文件的临时目录路径。
+-   `ZHIPU_API_KEY` (环境变量 `ZHIPU_API_KEY`): 智谱AI的API Key。虽然可以在请求中提供，但建议通过环境变量配置以增强安全性，服务启动时会加载。
+-   `ZHIPU_TEXTS_PER_CHUNK` (环境变量 `ZHIPU_TEXTS_PER_CHUNK`): 在调用智谱AI批量翻译接口时，每个子请求中包含的文本行数。默认值为10。此值影响API请求的频率和单次请求的数据量，可根据具体文本长度和API限制进行调整以优化性能。
 
 ## 智谱AI批量接口调用注意事项
 
