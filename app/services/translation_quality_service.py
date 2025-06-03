@@ -8,6 +8,9 @@ from app.services.tag_protection_service import TagProtectionService
 import datetime
 from collections import Counter
 import pandas as pd
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,7 @@ class TranslationQualityService:
     def __init__(self):
         self.tag_service = TagProtectionService()
         self.quality_threshold = 80.0  # 质量合格阈值
+        self.semantic_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')  # 加载多语言模型
         
         # 评分权重
         self.score_weights = {
@@ -70,7 +74,6 @@ class TranslationQualityService:
         # 常见问题模式
         self.issue_patterns = {
             'missing_tags': r'<[^>]+>|\[[^\]]+\]|\{[^}]+\}',  # 缺失的标签
-            'broken_format': r'%[sd]|{[\d]+}|\[[\d]+\]',  # 损坏的格式
             'inconsistent_case': r'[A-Z]{2,}|[a-z]{2,}',  # 大小写不一致
             'extra_spaces': r'\s{2,}',  # 多余的空格
             'missing_punctuation': r'[.!?。！？]$',  # 缺失的标点
@@ -298,50 +301,43 @@ class TranslationQualityService:
         source_lang: str,
         target_lang: str
     ) -> Tuple[float, List[str]]:
-        """评估语义准确性"""
+        """评估语义准确性（分数直接等于相似度*100）"""
         issues = []
-        
-        # 检查关键信息是否保留
+        # 计算语义相似度
+        source_embedding = self.semantic_model.encode(source_text)
+        translated_embedding = self.semantic_model.encode(translated_text)
+        similarity = cosine_similarity([source_embedding], [translated_embedding])[0][0]
+        score = similarity * 100
+        # 设置语义相似度阈值
+        semantic_threshold = 0.8
+        if similarity < semantic_threshold:
+            issues.append(f"语义相似度不足: {similarity:.2f} < {semantic_threshold}")
+        # 检查关键信息是否保留（保留原有逻辑）
         key_info_patterns = {
             'numbers': r'\d+',  # 数字
             'proper_nouns': r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*',  # 专有名词（支持多词）
             'abbreviations': r'[A-Z]{2,}',  # 缩写
             'special_terms': r'[A-Za-z]+(?:_[A-Za-z]+)+',  # 特殊术语（如item_sword）
         }
-        
         for info_type, pattern in key_info_patterns.items():
             source_info = re.findall(pattern, source_text)
             translated_info = re.findall(pattern, translated_text)
-            
-            # 对于数字，忽略前导零
             if info_type == 'numbers':
                 source_info = [str(int(num)) for num in source_info]
                 translated_info = [str(int(num)) for num in translated_info]
-            
-            # 对于专有名词和缩写，转换为小写进行比较
             elif info_type in ['proper_nouns', 'abbreviations']:
                 source_info = [info.lower() for info in source_info]
                 translated_info = [info.lower() for info in translated_info]
-                
-                # 对于中文文本，忽略专有名词和缩写的检查
                 if target_lang == 'zh':
                     continue
-            
-            # 对于特殊术语，保持原样比较
             elif info_type == 'special_terms':
                 pass
-            
-            # 检查数量是否匹配
             if len(source_info) != len(translated_info):
                 issues.append(f"{info_type}数量不匹配: 源文本 {len(source_info)} 个, 翻译后 {len(translated_info)} 个")
             else:
-                # 检查内容是否匹配
                 for src_info, trans_info in zip(source_info, translated_info):
                     if src_info != trans_info:
                         issues.append(f"{info_type}内容不一致: {src_info} -> {trans_info}")
-        
-        # 计算得分：如果没有问题，得分为100；每有一个问题扣20分
-        score = 100.0 if not issues else max(0.0, 100.0 - (len(issues) * 20.0))
         return score, issues
 
     def _evaluate_fluency(self, translated_text: str, target_lang: str) -> Tuple[float, List[str]]:
@@ -419,10 +415,20 @@ class TranslationQualityService:
             df: 包含评估结果的DataFrame
             output_path: 输出文件路径
         """
-        # 创建输出目录
-        output_dir = Path(output_path).parent
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # 重命名列名为中文
+        df = df.rename(columns={
+            'overall_score': '总体评分',
+            'tag_preservation_score': '标签保留评分',
+            'format_preservation_score': '格式保留评分',
+            'semantic_accuracy_score': '语义准确性评分',
+            'fluency_score': '流畅度评分',
+            'issues': '发现的问题',
+            'suggestions': '改进建议'
+        })
         
-        # 保存Excel文件
+        # 去除新增的语义准确度一列
+        # df['语义准确度'] = df['语义准确性评分']
+        
+        # 保存到Excel
         df.to_excel(output_path, index=False)
-        logger.info(f"Saved Excel evaluation result to {output_path}") 
+        logger.info(f"已保存评估结果到: {output_path}") 
