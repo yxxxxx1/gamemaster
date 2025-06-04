@@ -38,7 +38,7 @@ MAX_POLLING_ATTEMPTS = 540     # Increased from 120 to 540 (90 minutes at 10s in
 # ZHIPU_BATCH_API_ENDPOINT = "https://example.com/zhipu/batch_translate" # Not used anymore
 
 # Standard model if not specified by user or if batch API has a default
-DEFAULT_ZHIPU_MODEL = "GLM-4-FlashX-250414" # Example, check documentation for batch API compatible models
+DEFAULT_ZHIPU_MODEL = "GLM-4-Plus" # Example, check documentation for batch API compatible models
 
 # Placeholder for original newline characters
 ORIGINAL_NEWLINE_PLACEHOLDER = "___ORIGINAL_NL___"
@@ -314,13 +314,14 @@ async def translate_batch(
                 {
                     "role": "system",
                     "content": (
-                        f"你是一个专业的翻译助手。"
-                        f"请将用户提供的文本从{source_lang}准确翻译成{target_lang}。"
+                        f"你是一个专业的游戏本地化翻译专家。"
+                        f"请将用户提供的游戏文本从{source_lang}准确翻译成{target_lang}。"
                         f"用户输入的多行文本已使用换行符 '\n' 作为不同文本行之间的分隔。"
                         f"原文中固有的实际换行符已被特殊占位符 '{ORIGINAL_NEWLINE_PLACEHOLDER}' 替代。在翻译时，请将此占位符理解为原文中的实际换行，并在译文的对应位置将其准确地翻译和还原为实际的换行符或保留此占位符。"
                         f"至关重要：您的输出必须包含与输入完全相同数量的文本行。输入中的每一行（由 '\n' 分隔）必须在您的输出中有一个对应的翻译行（同样由 '\n' 分隔）。如果您翻译的某一行结果为空，您必须仍然输出一个空行（即，如果原文某行为空，译文也应为空行；如果原文某行有内容但译文逻辑上为空，也应输出空行）。总行数不得有任何偏差，必须为{len(chunk_texts)}行。"
                         f"务必完整保留原文中的所有其他特殊符号、标签和格式（例如游戏中的变量占位符 {{{{player_name}}}} 或格式标签 <color=red>text</color>）。"
                         f"除非 '{ORIGINAL_NEWLINE_PLACEHOLDER}' 指示，否则不要在单行译文内部随意添加或删除 '\n' 换行符。"
+                        f"请确保翻译符合游戏风格，保持角色对话的自然流畅，并适应目标语言的文化习惯。"
                     )
                 },
                 {
